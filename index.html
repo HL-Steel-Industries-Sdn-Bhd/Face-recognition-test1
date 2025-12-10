@@ -3,25 +3,55 @@
 <head>
 <meta charset="UTF-8" />
 <title>Face Sign In</title>
-<script defer src="https://cdn.jsdelivr.net/npm/face-api.js"></script>
+<script defer src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <style>
 body { font-family: Arial; text-align:center; margin-top:20px; }
-#video { width: 300px; border-radius:10px; }
+#video { width: 640px; height: 480px; border-radius:10px; }
+#status { margin: 10px 0; font-weight: bold; }
+.loading { color: blue; }
+.success { color: green; }
+.error { color: red; }
+canvas { position: absolute; top: 0; left: 0; z-index: 10; }
+.video-container { 
+    position: relative; 
+    display: inline-block; 
+    margin-bottom: 20px;
+}
+#recognitionInfo {
+    margin: 20px auto;
+    padding: 15px;
+    background-color: #f5f5f5;
+    border-radius: 8px;
+    max-width: 600px;
+    text-align: left;
+}
 </style>
 </head>
 <body>
 
 <h2>会议签到（人脸识别）</h2>
-<video id="video" autoplay muted></video><br><br>
 
-<form id="sendForm" method="post" action="https://script.google.com/macros/s/AKfycbz_0yF6MzRAFdTHv8fZ2Pd-2cGY9yEWSGVoUtw2LMAeEf1_YP5bGc4XW8IJCBg7lZ0C/exec">
+<div class="video-container">
+    <video id="video" width="640" height="480" autoplay muted></video>
+</div>
+
+<div id="status" class="loading">正在初始化...</div>
+
+<div id="recognitionInfo" style="display: none;">
+    <h3>识别结果</h3>
+    <p>姓名: <span id="recognizedName">-</span></p>
+    <p>距离: <span id="recognitionDistance">-</span></p>
+    <p>状态: <span id="recognitionStatus">正在识别...</span></p>
+</div>
+
+<form id="sendForm" method="post" action="https://script.google.com/macros/s/AKfycbz_0yF6MzRAFdTHv8fZ2Pd-2cGY9yEWSGVoUtw2LMAeEf1_YP5bGc4XW8IJCBg7lZ0C/exec" style="display: none;">
     <input type="hidden" name="name" id="nameField">
     <input type="hidden" name="timestamp" id="timeField">
 </form>
 
 <script>
 // ===============================
-// 贴你的 embedding 在这里
+// 已知用户的 embedding 数据
 // ===============================
 const KNOWN_DATA = [
 {
@@ -161,65 +191,273 @@ const KNOWN_DATA = [
 }
 ];
 
-// 加载模型
-async function loadModels() {
-    await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/npm/face-api.js/weights/");
-    await faceapi.nets.faceRecognitionNet.loadFromUri("https://cdn.jsdelivr.net/npm/face-api.js/weights/");
-    await faceapi.nets.faceLandmark68Net.loadFromUri("https://cdn.jsdelivr.net/npm/face-api.js/weights/");
-}
-loadModels();
+// 全局变量
+let isRecognizing = false;
+let modelsLoaded = false;
+let hasSignedIn = false;
 
-navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
-    document.getElementById("video").srcObject = stream;
+// DOM 元素引用
+const videoElement = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const recognitionInfoEl = document.getElementById('recognitionInfo');
+const recognizedNameEl = document.getElementById('recognizedName');
+const recognitionDistanceEl = document.getElementById('recognitionDistance');
+const recognitionStatusEl = document.getElementById('recognitionStatus');
+
+// 页面加载后执行
+window.addEventListener('load', async () => {
+    try {
+        statusEl.textContent = '正在检查 face-api.js...';
+        statusEl.className = 'loading';
+        
+        // 检查 faceapi 是否已加载
+        await checkFaceAPI();
+        
+        // 启动摄像头
+        await startCamera();
+        
+        // 加载模型
+        await loadModels();
+        
+        modelsLoaded = true;
+        statusEl.textContent = '✓ 准备就绪！开始人脸识别...';
+        statusEl.className = 'success';
+        
+        // 显示识别信息区域
+        recognitionInfoEl.style.display = 'block';
+        
+        // 开始识别循环
+        recognizeLoop();
+        
+    } catch (error) {
+        console.error('初始化失败:', error);
+        statusEl.textContent = '初始化失败: ' + error.message;
+        statusEl.className = 'error';
+    }
 });
 
-function euclidDist(a, b) {
-    let s = 0;
-    for (let i = 0; i < a.length; i++) {
-        let d = a[i] - b[i];
-        s += d * d;
-    }
-    return Math.sqrt(s);
-}
-
-async function recognizeLoop() {
-    const video = document.getElementById("video");
-    const det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-
-    if (det) {
-        const live = det.descriptor;
-        let bestName = "UNKNOWN";
-        let bestDist = 999;
-
-        for (const p of KNOWN_DATA) {
-            const dist = euclidDist(live, p.embedding);
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestName = p.name;
-            }
-        }
-
-        if (bestDist < 0.45) {  // 阈值 0.45–0.5 比较稳
-            sendSignIn(bestName);
+// 检查 faceapi 是否加载
+function checkFaceAPI() {
+    return new Promise((resolve, reject) => {
+        if (window.faceapi) {
+            console.log('faceapi 已加载');
+            resolve();
             return;
         }
+        
+        let attempts = 0;
+        const maxAttempts = 30;
+        const interval = setInterval(() => {
+            attempts++;
+            if (window.faceapi) {
+                clearInterval(interval);
+                console.log('faceapi 加载成功');
+                resolve();
+            } else if (attempts >= maxAttempts) {
+                clearInterval(interval);
+                reject(new Error('face-api.js 加载超时'));
+            }
+        }, 100);
+    });
+}
+
+// 启动摄像头
+async function startCamera() {
+    try {
+        statusEl.textContent = '正在请求摄像头权限...';
+        statusEl.className = 'loading';
+        
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { 
+                width: 640, 
+                height: 480,
+                facingMode: "user" 
+            } 
+        });
+        
+        videoElement.srcObject = stream;
+        
+        return new Promise((resolve) => {
+            videoElement.onloadedmetadata = () => {
+                videoElement.play();
+                console.log('摄像头启动，视频尺寸:', videoElement.videoWidth, 'x', videoElement.videoHeight);
+                resolve();
+            };
+        });
+    } catch (error) {
+        console.error('摄像头错误:', error);
+        throw new Error('无法访问摄像头: ' + error.message);
     }
-
-    setTimeout(recognizeLoop, 300);
 }
 
-recognizeLoop();
-
-function sendSignIn(name) {
-    document.getElementById("nameField").value = name;
-    document.getElementById("timeField").value = new Date().toISOString();
-
-    document.getElementById("sendForm").submit();
-    alert("签到成功: " + name);
+// 加载模型
+async function loadModels() {
+    try {
+        statusEl.textContent = '正在加载人脸识别模型...';
+        statusEl.className = 'loading';
+        
+        // 使用正确的模型路径
+        const MODEL_URL = "https://justadudewhohacks.github.io/face-api.js/models";
+        
+        console.log('开始加载模型...');
+        
+        // 加载所需模型
+        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+        
+        console.log('所有模型加载成功');
+        
+    } catch (error) {
+        console.error('模型加载失败:', error);
+        throw new Error('模型加载失败: ' + error.message);
+    }
 }
+
+// 计算欧几里得距离
+function euclidDist(a, b) {
+    let sum = 0;
+    for (let i = 0; i < a.length; i++) {
+        const diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return Math.sqrt(sum);
+}
+
+// 识别循环
+async function recognizeLoop() {
+    if (!modelsLoaded || isRecognizing || hasSignedIn) return;
+    
+    try {
+        isRecognizing = true;
+        
+        // 检测人脸
+        const detection = await faceapi
+            .detectSingleFace(videoElement, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+        
+        if (detection) {
+            const liveEmbedding = detection.descriptor;
+            let bestName = "UNKNOWN";
+            let bestDist = 999;
+            
+            // 与已知数据比较
+            for (const person of KNOWN_DATA) {
+                const dist = euclidDist(liveEmbedding, person.embedding);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestName = person.name;
+                }
+            }
+            
+            // 更新UI显示
+            recognizedNameEl.textContent = bestName;
+            recognitionDistanceEl.textContent = bestDist.toFixed(4);
+            
+            // 阈值判断
+            const THRESHOLD = 0.5; // 可以调整这个阈值
+            if (bestDist < THRESHOLD) {
+                recognitionStatusEl.textContent = '✓ 匹配成功！';
+                recognitionStatusEl.style.color = 'green';
+                
+                // 防止重复签到
+                if (!hasSignedIn) {
+                    hasSignedIn = true;
+                    sendSignIn(bestName, bestDist);
+                }
+            } else {
+                recognitionStatusEl.textContent = '距离过大，未匹配';
+                recognitionStatusEl.style.color = 'red';
+            }
+            
+            // 绘制检测框
+            drawDetection(detection);
+            
+        } else {
+            recognizedNameEl.textContent = '-';
+            recognitionDistanceEl.textContent = '-';
+            recognitionStatusEl.textContent = '未检测到人脸';
+            recognitionStatusEl.style.color = 'orange';
+        }
+        
+    } catch (error) {
+        console.error('识别错误:', error);
+        recognitionStatusEl.textContent = '识别错误: ' + error.message;
+        recognitionStatusEl.style.color = 'red';
+    } finally {
+        isRecognizing = false;
+        
+        // 如果没有签到成功，继续识别
+        if (!hasSignedIn) {
+            setTimeout(recognizeLoop, 500); // 0.5秒后再次识别
+        }
+    }
+}
+
+// 绘制检测结果
+function drawDetection(detection) {
+    // 移除之前的canvas
+    const oldCanvas = document.querySelector('canvas');
+    if (oldCanvas) oldCanvas.remove();
+    
+    // 创建canvas
+    const canvas = faceapi.createCanvasFromMedia(videoElement);
+    const container = document.querySelector('.video-container');
+    container.appendChild(canvas);
+    
+    // 匹配尺寸
+    const displaySize = { width: videoElement.width, height: videoElement.height };
+    faceapi.matchDimensions(canvas, displaySize);
+    
+    // 调整检测结果尺寸
+    const resizedDetection = faceapi.resizeResults(detection, displaySize);
+    
+    // 绘制
+    faceapi.draw.drawDetections(canvas, [resizedDetection]);
+    faceapi.draw.drawFaceLandmarks(canvas, [resizedDetection]);
+}
+
+// 发送签到信息
+function sendSignIn(name, distance) {
+    try {
+        document.getElementById("nameField").value = name;
+        document.getElementById("timeField").value = new Date().toISOString();
+        
+        // 显示最终状态
+        statusEl.textContent = `✓ 签到成功: ${name} (距离: ${distance.toFixed(4)})`;
+        statusEl.className = 'success';
+        
+        // 提交表单
+        document.getElementById("sendForm").submit();
+        
+        console.log('签到成功:', name);
+        
+        // 显示成功消息
+        alert(`签到成功！\n姓名: ${name}\n距离: ${distance.toFixed(4)}\n时间: ${new Date().toLocaleString()}`);
+        
+    } catch (error) {
+        console.error('提交失败:', error);
+        alert('签到提交失败，请手动记录。错误: ' + error.message);
+    }
+}
+
+// 添加页面卸载时的清理
+window.addEventListener('beforeunload', () => {
+    if (videoElement.srcObject) {
+        const tracks = videoElement.srcObject.getTracks();
+        tracks.forEach(track => track.stop());
+    }
+});
+
+// 全局错误处理
+window.addEventListener('error', (e) => {
+    console.error('全局错误:', e.error);
+    if (statusEl) {
+        statusEl.textContent = '发生错误: ' + e.message;
+        statusEl.className = 'error';
+    }
+});
 </script>
 
 </body>
